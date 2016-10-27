@@ -267,8 +267,9 @@ class GeoNear2DStage::DensityEstimator {
 public:
     DensityEstimator(PlanStage::Children* children,
                      const IndexDescriptor* twoDindex,
-                     const GeoNearParams* nearParams)
-        : _children(children), _twoDIndex(twoDindex), _nearParams(nearParams), _currentLevel(0) {
+                     const GeoNearParams* nearParams,
+                     const R2Annulus* fullBounds)
+        : _children(children), _twoDIndex(twoDindex), _nearParams(nearParams), _fullBounds(fullBounds), _currentLevel(0) {
         GeoHashConverter::Parameters hashParams;
         Status status = GeoHashConverter::parseParameters(_twoDIndex->infoObj(), &hashParams);
         // The index status should always be valid.
@@ -281,6 +282,9 @@ public:
         // we have to start to find documents at most GeoHash::kMaxBits - 1. Thus the finest
         // search area is 16 * finest cell area at GeoHash::kMaxBits.
         _currentLevel = std::max(0u, hashParams.bits - 1u);
+
+        // Set _minLevel to the level of the smallest GeoHash that contains the entire search annulus,
+        setMinLevel();
     }
 
     PlanStage::StageState work(OperationContext* txn,
@@ -291,14 +295,17 @@ public:
 
 private:
     void buildIndexScan(OperationContext* txn, WorkingSet* workingSet, Collection* collection);
+    void setMinLevel();
 
     PlanStage::Children* _children;     // Points to PlanStage::_children in the NearStage.
     const IndexDescriptor* _twoDIndex;  // Not owned here.
     const GeoNearParams* _nearParams;   // Not owned here.
+    const R2Annulus* _fullBounds;       // Not owned here.
     IndexScan* _indexScan = nullptr;    // Owned in PlanStage::_children.
     unique_ptr<GeoHashConverter> _converter;
     GeoHash _centroidCell;
     unsigned _currentLevel;
+    unsigned _minLevel;
 };
 
 // Initialize the internal states
@@ -346,6 +353,20 @@ void GeoNear2DStage::DensityEstimator::buildIndexScan(OperationContext* txn,
     _children->emplace_back(_indexScan);
 }
 
+void GeoNear2DStage::DensityEstimator::setMinLevel() {
+    double outerBound = _fullBounds->getOuter();
+
+    unsigned minLevel = _currentLevel;
+    double edgeSize = _converter->sizeEdge(minLevel);
+
+    while(edgeSize < outerBound) {
+        minLevel--;
+        edgeSize = _converter->sizeEdge(minLevel);
+    }
+
+    _minLevel = std::max(0u, minLevel);
+}
+
 // Return IS_EOF is we find a document in it's ancestor cells and set estimated distance
 // from the nearest document.
 PlanStage::StageState GeoNear2DStage::DensityEstimator::work(OperationContext* txn,
@@ -362,6 +383,12 @@ PlanStage::StageState GeoNear2DStage::DensityEstimator::work(OperationContext* t
     PlanStage::StageState state = _indexScan->work(&workingSetID);
 
     if (state == PlanStage::IS_EOF) {
+        // We already contain the entire search annulus, so return its outer bound
+        if (_currentLevel <= _minLevel) {
+            *estimatedDistance = _converter->sizeEdge(_currentLevel);
+            return PlanStage::IS_EOF;
+        }
+
         // We ran through the neighbors but found nothing.
         if (_currentLevel > 0u) {
             // Advance to the next level and search again.
@@ -395,7 +422,7 @@ PlanStage::StageState GeoNear2DStage::initialize(OperationContext* txn,
                                                  Collection* collection,
                                                  WorkingSetID* out) {
     if (!_densityEstimator) {
-        _densityEstimator.reset(new DensityEstimator(&_children, _twoDIndex, &_nearParams));
+        _densityEstimator.reset(new DensityEstimator(&_children, _twoDIndex, &_nearParams, &_fullBounds));
     }
 
     double estimatedDistance;
@@ -805,16 +832,21 @@ public:
     DensityEstimator(PlanStage::Children* children,
                      const IndexDescriptor* s2Index,
                      const GeoNearParams* nearParams,
+                     const R2Annulus* fullBounds,
                      const S2IndexingParams& indexParams)
         : _children(children),
           _s2Index(s2Index),
           _nearParams(nearParams),
+          _fullBounds(fullBounds),
           _indexParams(indexParams),
           _currentLevel(0) {
         // cellId.AppendVertexNeighbors(level, output) requires level < finest,
         // so we use the minimum of max_level - 1 and the user specified finest
         int level = std::min(S2::kMaxCellLevel - 1, internalQueryS2GeoFinestLevel.load());
         _currentLevel = std::max(0, level);
+
+        // Set _minLevel to the level of the smallest S2Cell with a min width that contains the entire search annulus,
+        setMinLevel();
     }
 
     // Search for a document in neighbors at current level.
@@ -827,14 +859,31 @@ public:
 
 private:
     void buildIndexScan(OperationContext* txn, WorkingSet* workingSet, Collection* collection);
+    void setMinLevel();
 
     PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
     const IndexDescriptor* _s2Index;   // Not owned here.
     const GeoNearParams* _nearParams;  // Not owned here.
+    const R2Annulus* _fullBounds;      // Not owned here.
     const S2IndexingParams _indexParams;
     int _currentLevel;
+    int _minLevel;
     IndexScan* _indexScan = nullptr;  // Owned in PlanStage::_children.
 };
+
+void GeoNear2DSphereStage::DensityEstimator::setMinLevel() {
+    double outerBound = _fullBounds->getOuter();
+
+    unsigned minLevel = _currentLevel;
+    double minWidth = S2::kMinWidth.GetValue(minLevel) * kRadiusOfEarthInMeters;
+
+    while(minWidth < outerBound) {
+      minLevel--;
+      minWidth = S2::kMinWidth.GetValue(minLevel) * kRadiusOfEarthInMeters;
+    }
+
+    _minLevel = std::max(0u, minLevel);
+}
 
 // Setup the index scan stage for neighbors at this level.
 void GeoNear2DSphereStage::DensityEstimator::buildIndexScan(OperationContext* txn,
@@ -884,6 +933,12 @@ PlanStage::StageState GeoNear2DSphereStage::DensityEstimator::work(OperationCont
     PlanStage::StageState state = _indexScan->work(&workingSetID);
 
     if (state == PlanStage::IS_EOF) {
+        // We already contain the entire search annulus, so return its outer bound
+        if (_currentLevel <= _minLevel) {
+            *estimatedDistance = S2::kMinWidth.GetValue(_currentLevel) * kRadiusOfEarthInMeters;
+            return PlanStage::IS_EOF;
+        }
+
         // We ran through the neighbors but found nothing.
         if (_currentLevel > 0) {
             // Advance to the next level and search again.
@@ -919,7 +974,7 @@ PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* txn,
                                                        WorkingSetID* out) {
     if (!_densityEstimator) {
         _densityEstimator.reset(
-            new DensityEstimator(&_children, _s2Index, &_nearParams, _indexParams));
+            new DensityEstimator(&_children, _s2Index, &_nearParams, &_fullBounds, _indexParams));
     }
 
     double estimatedDistance;
